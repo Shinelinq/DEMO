@@ -22,19 +22,103 @@ def init_seed(seed=3407):
 
 
 def init_logger():
+    """
+    初始化日志系统：
+    - 保留原有终端输出；
+    - 将 logging、print、tqdm 等同时写入项目根目录下 Logs/run-YYYYmmdd-HHMMSS.log；
+    - 使用行缓冲（buffering=1）确保实时落盘；
+    - 仅在本函数内完成修改。
+    """
+    import sys
+    from pathlib import Path
+    from datetime import datetime
+    import atexit
+
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    # create consol handler
-    consol_handler = logging.StreamHandler()
+    # 防重：若已初始化则直接返回
+    if getattr(logger, "_file_logging_initialized", False):
+        return logger
+
+    # 日志目录与文件
+    root_dir = Path(__file__).resolve().parent
+    logs_dir = root_dir / 'Logs'
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_filename = f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    log_path = logs_dir / log_filename
+
+    # 行缓冲模式打开日志文件
+    log_file = open(log_path, 'a', encoding='utf-8', buffering=1)
+
+    # Tee 到终端与文件，确保 print/tqdm 也写入文件
+    class TeeStream:
+        def __init__(self, orig_stream, file_stream):
+            self._orig = orig_stream
+            self._file = file_stream
+
+        def write(self, data):
+            # 同时写入原始终端与日志文件
+            try:
+                self._orig.write(data)
+            except Exception:
+                pass
+            try:
+                self._file.write(data)
+            except Exception:
+                pass
+
+        def flush(self):
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+            try:
+                self._file.flush()
+            except Exception:
+                pass
+
+        def isatty(self):
+            try:
+                return self._orig.isatty()
+            except Exception:
+                return False
+
+        @property
+        def encoding(self):
+            return getattr(self._orig, "encoding", "utf-8")
+
+        def fileno(self):
+            fn = getattr(self._orig, "fileno", None)
+            return fn() if callable(fn) else None
+
+        def writable(self):
+            return True
+
+    # 先替换 sys.stdout/sys.stderr，再创建控制台 handler，使其写入到 Tee（从而被同时记录到文件）
+    sys.stdout = TeeStream(sys.stdout, log_file)
+    sys.stderr = TeeStream(sys.stderr, log_file)
+
+    # 控制台输出（保留原有行为与格式）
+    consol_handler = logging.StreamHandler()  # 默认写入 sys.stderr（已被 Tee 包装）
     consol_handler.setLevel(logging.INFO)
 
-    # set format
     formatter = logging.Formatter(
         '[%(asctime)s %(filename)s line:%(lineno)d process:%(process)d] %(levelname)s: %(message)s'
     )
     consol_handler.setFormatter(formatter)
-    logger.addHandler(consol_handler)
+
+    # 为避免重复添加 handler，仅在不存在时添加
+    if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        logger.addHandler(consol_handler)
+
+    # 退出时关闭日志文件
+    atexit.register(log_file.close)
+
+    # 记录初始化状态
+    logger._file_logging_initialized = True
+    logger._file_logging_fp = log_file
+
     return logger
 
 
