@@ -53,27 +53,64 @@ def init_logger():
 
     # Tee 到终端与文件，确保 print/tqdm 也写入文件
     class TeeStream:
+        """
+        将输出同时写入原始终端与日志文件。
+        - 终端：保持原样（保留 \r 动态刷新与 ANSI 颜色）。
+        - 文件：仅写入“完整行”（以 \n 结尾），忽略 \r 刷新；去除 ANSI 控制符。
+        - 退出：写出缓冲区中最后一行。
+        """
         def __init__(self, orig_stream, file_stream):
+            import re
             self._orig = orig_stream
             self._file = file_stream
+            self._line_buffer = ""  # 累积当前未结束的行
+            # ANSI 控制符匹配（CSI、SGR 等通用序列）
+            self._ansi_re = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
         def write(self, data):
-            # 同时写入原始终端与日志文件
+            # 终端保持原样输出
             try:
                 self._orig.write(data)
             except Exception:
                 pass
+
+            # 文件侧：去除 ANSI，仅在遇到 \n 时落盘，\r 视为行头重置（覆盖式刷新）
             try:
-                self._file.write(data)
+                text = data if isinstance(data, str) else str(data)
+                sanitized = self._ansi_re.sub('', text)
+
+                wrote_line = False
+                for ch in sanitized:
+                    if ch == '\r':
+                        # 进度刷新：重置当前行缓冲，仅保留最新内容
+                        self._line_buffer = ''
+                    elif ch == '\n':
+                        # 完整行：写入文件并清空缓冲
+                        self._file.write(self._line_buffer + '\n')
+                        self._line_buffer = ''
+                        wrote_line = True
+                    else:
+                        self._line_buffer += ch
+
+                # 若本次写入形成了完整行，触发刷新以确保实时落盘
+                if wrote_line:
+                    self._file.flush()
             except Exception:
                 pass
 
         def flush(self):
+            # 刷新终端；文件仅在已有完整行时由 write 触发 flush
             try:
                 self._orig.flush()
             except Exception:
                 pass
+
+        def flush_pending(self):
+            # 程序退出时写出最后一行（若存在未以 \n 结束的缓冲）
             try:
+                if self._line_buffer:
+                    self._file.write(self._line_buffer + '\n')
+                    self._line_buffer = ''
                 self._file.flush()
             except Exception:
                 pass
@@ -96,8 +133,10 @@ def init_logger():
             return True
 
     # 先替换 sys.stdout/sys.stderr，再创建控制台 handler，使其写入到 Tee（从而被同时记录到文件）
-    sys.stdout = TeeStream(sys.stdout, log_file)
-    sys.stderr = TeeStream(sys.stderr, log_file)
+    tee_stdout = TeeStream(sys.stdout, log_file)
+    tee_stderr = TeeStream(sys.stderr, log_file)
+    sys.stdout = tee_stdout
+    sys.stderr = tee_stderr
 
     # 控制台输出（保留原有行为与格式）
     consol_handler = logging.StreamHandler()  # 默认写入 sys.stderr（已被 Tee 包装）
@@ -112,8 +151,10 @@ def init_logger():
     if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
         logger.addHandler(consol_handler)
 
-    # 退出时关闭日志文件
-    atexit.register(log_file.close)
+    # 退出时按顺序：先写出未落盘最后一行，再关闭日志文件
+    atexit.register(log_file.close)  # 最后执行（atexit 逆序调用）
+    atexit.register(tee_stderr.flush_pending)
+    atexit.register(tee_stdout.flush_pending)
 
     # 记录初始化状态
     logger._file_logging_initialized = True
