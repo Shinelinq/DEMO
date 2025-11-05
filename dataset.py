@@ -1,4 +1,5 @@
 from collections import Counter
+import logging
 
 import numpy as np
 import torch
@@ -192,4 +193,31 @@ class PoiDataset(Dataset):
         traj_graph = self.traj_graph[int(user[0])]
         geo_graph = self.geo_graph[int(user[0])]
 
-        return user, traj, geo, center_traj, long_traj, dt, label_traj, label_geo, negihbors_mask, traj_graph, geo_graph
+        # 显式字典返回，确保与 G5 标签完全一致的时间对齐/填充/忽略规则
+        sample = {
+            "user": user,
+            "traj": traj,
+            "geo": geo,
+            "center_traj": center_traj,
+            "long_traj": long_traj,
+            "dt": dt,
+            "label_traj": label_traj,
+            "label_geo": label_geo,
+            "negihbors_mask": negihbors_mask,
+            "traj_graph": traj_graph,
+            "geo_graph": geo_graph,
+        }
+
+        # 若启用 G4：严格校验缓存并生成 label_geo_4；否则不返回该键
+        if hasattr(self.config, 'geohash_precisions') and 4 in self.config.geohash_precisions:
+            if 'geohash_id_4' not in self.checkins.columns:
+                logging.getLogger().error('[ERROR] geohash_id_4 missing. Phase-0 requires rebuilt cache with G4. Please rebuild cache.')
+                raise SystemExit(1)
+            g4_vals = self.checkins['geohash_id_4'].values
+            label_geo_4 = torch.from_numpy(g4_vals[start + 1:end + 1])
+            if len(user) != self.config.max_sequence_length:
+                padding_length = self.config.max_sequence_length - len(user)
+                label_geo_4 = F.pad(label_geo_4, [0, padding_length])
+            sample["label_geo_4"] = label_geo_4
+
+        return sample

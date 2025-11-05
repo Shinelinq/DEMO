@@ -1,4 +1,6 @@
 from pathlib import Path
+import logging
+import sys
 
 import pandas as pd
 import torch
@@ -126,6 +128,13 @@ class Poidataloader():
     def load_checkins(self, dataset, file):
         if (self.database / f'checkins_{dataset}.pkl').exists():
             checkins = pd.read_pickle(self.database / f'checkins_{dataset}.pkl')
+            # Phase-0: 若启用 G4 且旧缓存缺少 geohash_id_4，则立即 fail-fast
+            if 'geohash_id_4' not in checkins.columns:
+                if hasattr(self.config, 'geohash_precisions') and 4 in self.config.geohash_precisions:
+                    logging.getLogger().error('[ERROR] geohash_id_4 missing. Phase-0 requires rebuilt cache with G4. Please rebuild cache.')
+                    raise SystemExit(1)
+                else:
+                    logging.getLogger().info('检测到旧缓存缺少 geohash_id_4（当前未启用 G4）。如需启用 G4，请重建缓存。')
             return checkins
 
         checkins = pd.read_csv(
@@ -134,6 +143,9 @@ class Poidataloader():
         checkins = checkins.dropna().drop_duplicates()
         checkins.reset_index(drop=True, inplace=True)
         checkins = utils.geohash_encode(checkins)
+        # 生成 G4 字段（使用相同编码接口），作为新增缓存列
+        checkins_g4 = utils.geohash_encode(checkins.copy(), precision=4)
+        checkins['geohash_4'] = checkins_g4['geohash']
         checkins = self.__convert(checkins)
         checkins.to_pickle(self.database / f'checkins_{dataset}.pkl')
         return checkins
@@ -152,6 +164,9 @@ class Poidataloader():
         checkins, user2id = item2id(checkins, 'user')
         checkins, location2id = item2id(checkins, 'location')
         checkins, geohash2id = item2id(checkins, 'geohash')
+        # 为 G4 创建全局 id，并统一列名为 geohash_id_4
+        checkins, geohash4_2id = item2id(checkins, 'geohash_4')
+        checkins.rename(columns={'geohash_4_id': 'geohash_id_4'}, inplace=True)
         # time -> time_unix
         checkins.insert(checkins.shape[1], 'time_unix',
                         checkins['time'].astype('int') // 10**9)
