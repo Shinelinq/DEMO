@@ -72,12 +72,9 @@ def get_args():
     args.dataset_test_path = args.database / f'dataset_{args.dataset}_test.pkl'
 
     if args.dataset == 'Gowalla':
-        args.loss_rate = 0.8
         args.dataset_file = './Datasets/checkins-gowalla.txt'
     elif args.dataset == 'Foursquare':
-        args.loss_rate = 0.2
         args.dataset_file = './Datasets/checkins-4sq.txt'
     elif args.dataset == 'Yelp':
-        args.loss_rate = 0.0
         args.dataset_file = './Datasets/checkins-yelp.txt'
     return args
