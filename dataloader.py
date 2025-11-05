@@ -27,7 +27,7 @@ class Poidataloader():
         setattr(self.config, 'max_loc_num', self.location_count() + 1)
         setattr(self.config, 'max_geo_num', self.geohash_count() + 1)
         # Phase-0: 在数据加载完成后，若启用 G4，则检测并设置 G4 词表大小（V_G4）
-        if hasattr(self.config, 'geohash_precisions') and (4 in self.config.geohash_precisions):
+        if 4 in self.config.geohash_precisions:
             if 'geohash_id_4' not in self.checkins.columns:
                 raise SystemExit('[ERROR] geohash_id_4 missing. Please rebuild cache with G4 enabled.')
             v_g4 = int(self.checkins['geohash_id_4'].nunique()) + 1
@@ -120,14 +120,7 @@ class Poidataloader():
         setattr(self.config, 'max_loc_num', int(self.dataset_static[1]))
         setattr(self.config, 'max_geo_num', int(self.dataset_static[2]))
         # Phase-0: 在静态参数加载完成后，若启用 G4，则检测并设置 G4 词表大小（V_G4）
-        if hasattr(self.config, 'geohash_precisions') and (4 in self.config.geohash_precisions):
-            # 若未加载 checkins，则尝试从持久化缓存读取
-            if not hasattr(self, 'checkins') or self.checkins is None:
-                checkins_pkl = self.database / f'checkins_{self.config.dataset}.pkl'
-                if not checkins_pkl.exists():
-                    raise SystemExit('[ERROR] geohash_id_4 missing. Please rebuild cache with G4 enabled.')
-                import pandas as pd
-                self.checkins = pd.read_pickle(checkins_pkl)
+        if 4 in self.config.geohash_precisions:
             if 'geohash_id_4' not in self.checkins.columns:
                 raise SystemExit('[ERROR] geohash_id_4 missing. Please rebuild cache with G4 enabled.')
             v_g4 = int(self.checkins['geohash_id_4'].nunique()) + 1

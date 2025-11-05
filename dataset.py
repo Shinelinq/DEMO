@@ -170,7 +170,6 @@ class PoiDataset(Dataset):
             traj = F.pad(traj, [0, padding_length])
             time = F.pad(time, [0, padding_length])
             geo = F.pad(geo, [0, padding_length])
-            center_traj = F.pad(center_traj, [0, padding_length])
             label_traj = F.pad(label_traj, [0, padding_length])
             label_geo = F.pad(label_geo, [0, padding_length])
 

@@ -53,7 +53,8 @@ def get_args():
     parser.add_argument('--lambda_regions',
                         nargs='+',
                         type=float,
-                        required=True,
+                        # required=True,
+                        default=[0.8],
                         help='Region loss weights aligned with geohash_precisions; single value will broadcast')
     parser.add_argument('--use_warmup',
                         type=int,
