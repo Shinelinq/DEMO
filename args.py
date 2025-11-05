@@ -44,6 +44,26 @@ def get_args():
     parser.add_argument('--epochs', default=50, type=int, help='Train epochs.')
     parser.add_argument('--alpha', default=0.1, type=float, help='.')
     parser.add_argument('--beta', default=0.1, type=float, help='.')
+    # Phase-0 参数化：多粒度与 warm-up
+    parser.add_argument('--geohash_precisions',
+                        nargs='+',
+                        type=int,
+                        default=[5],
+                        help='Enabled geohash granularities, e.g., 4 5 or 4 5 6')
+    parser.add_argument('--lambda_regions',
+                        nargs='+',
+                        type=float,
+                        required=True,
+                        help='Region loss weights aligned with geohash_precisions; single value will broadcast')
+    parser.add_argument('--use_warmup',
+                        type=int,
+                        choices=[0, 1],
+                        default=0,
+                        help='Enable warm-up (0/1)')
+    parser.add_argument('--warmup_epochs',
+                        type=int,
+                        default=10,
+                        help='Warm-up epochs (placeholder when use_warmup=0)')
     args = parser.parse_args()
     args.model_path = Path(args.model_path)
     args.model_dir = Path(args.model_dir)
