@@ -71,44 +71,110 @@ class Trainer:
         train_loss = []
         pbar = tqdm(train_dl, total=len(train_dl))
         for idx, dl in enumerate(pbar):
-            user, traj, geo, center_traj, long_traj, dt, label_traj, \
-                label_geo, negihbors_mask, traj_graph, geo_graph = dl
-            user = user.to(self.device)
-            traj = traj.to(self.device)
-            geo = geo.to(self.device)
-            center_traj = center_traj.to(self.device)
-            long_traj = long_traj.to(self.device)
-            dt = dt.to(self.device)
-            label_traj = label_traj.to(self.device)
-            label_geo = label_geo.to(self.device)
-            negihbors_mask = negihbors_mask.to(self.device)
-            traj_graph = traj_graph.to(self.device)
-            geo_graph = geo_graph.to(self.device)
+            # 兼容 batch 为 dict 或 tuple，两种路径均支持
+            if isinstance(dl, dict):
+                user = dl["user"].to(self.device)
+                traj = dl["traj"].to(self.device)
+                geo = dl["geo"].to(self.device)
+                center_traj = dl["center_traj"].to(self.device)
+                long_traj = dl["long_traj"].to(self.device)
+                dt = dl["dt"].to(self.device)
+                label_traj = dl["label_traj"].to(self.device)
+                label_geo_5 = dl["label_geo"].to(self.device)
+                label_geo_4 = dl.get("label_geo_4", None)
+                if label_geo_4 is not None:
+                    label_geo_4 = label_geo_4.to(self.device)
+                negihbors_mask = dl["negihbors_mask"].to(self.device)
+                traj_graph = dl["traj_graph"].to(self.device)
+                geo_graph = dl["geo_graph"].to(self.device)
+            else:
+                user, traj, geo, center_traj, long_traj, dt, label_traj, \
+                    label_geo, negihbors_mask, traj_graph, geo_graph = dl
+                user = user.to(self.device)
+                traj = traj.to(self.device)
+                geo = geo.to(self.device)
+                center_traj = center_traj.to(self.device)
+                long_traj = long_traj.to(self.device)
+                dt = dt.to(self.device)
+                label_traj = label_traj.to(self.device)
+                label_geo_5 = label_geo.to(self.device)
+                label_geo_4 = None
+                negihbors_mask = negihbors_mask.to(self.device)
+                traj_graph = traj_graph.to(self.device)
+                geo_graph = geo_graph.to(self.device)
 
             optimizer.zero_grad()
-            pred = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
-                         geo_graph)
-            is_pred_tuple = False
-            if isinstance(pred, tuple):
-                pred, pred_geo = pred
-                is_pred_tuple = True
-            if self.config.mask:
+            outputs = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
+                            geo_graph)
+            # 旧路径：二元组 (pred_traj, pred_geo_5)
+            if isinstance(outputs, tuple):
+                pred_traj = outputs[0]
+                pred_geo_5 = outputs[1]
+            else:
+                pred_traj = outputs
+                pred_geo_5 = None
+
+            # 兼容性读取 G4：优先从 outputs[2]（若为字典）读取，否则兜底 model.pred_regions
+            pred_geo_4 = None
+            if isinstance(outputs, tuple) and len(outputs) >= 3 and isinstance(outputs[2], dict):
+                pred_regions = outputs[2]
+                pred_geo_4 = pred_regions.get("G4", None)
+            else:
+                pred_regions = getattr(model, "pred_regions", None)
+                if isinstance(pred_regions, dict):
+                    pred_geo_4 = pred_regions.get("G4", None)
+
+            if hasattr(self.config, 'mask') and self.config.mask:
                 negihbors_mask = negihbors_mask.unsqueeze(1).repeat(
                     1, self.config.max_sequence_length, 1)
-                pred.masked_fill_(negihbors_mask, -1000)
+                pred_traj.masked_fill_(negihbors_mask, -1000)
 
-            loss_all = criterion(pred.permute(0, 2, 1), label_traj)
-            if is_pred_tuple:
-                loss_geo = criterion(pred_geo.permute(0, 2, 1), label_geo)
-                loss_all = loss_all + loss_geo * self.config.loss_rate
+            # 计算损失（全局 softmax + CE），保持 ignore_index 与现有 criterion 一致
+            loss_poi = criterion(pred_traj.permute(0, 2, 1), label_traj)
+            loss_geo_g5 = None
+            loss_geo_g4 = None
+            if pred_geo_5 is not None:
+                loss_geo_g5 = criterion(pred_geo_5.permute(0, 2, 1), label_geo_5)
+            if hasattr(self.config, 'geohash_precisions') and (4 in self.config.geohash_precisions):
+                # fail-fast：启用 G4 必须有 label 与 pred
+                if label_geo_4 is None:
+                    self.logger.error('[ERROR] 缺少 label_geo_4。请检查数据缓存是否包含 geohash_id_4。')
+                    raise SystemExit(1)
+                if pred_geo_4 is None:
+                    self.logger.error('[ERROR] 缺少 pred_geo_4。请检查模型是否正确提供 G4 区域头。')
+                    raise SystemExit(1)
+                # 词表尺寸确认：pred 与头的 out_features 一致
+                vg4_out = getattr(getattr(model, 'fc_geo_4', None), 'out_features', None)
+                if vg4_out is None or vg4_out != pred_geo_4.shape[-1]:
+                    self.logger.error('[ERROR] G4 词表尺寸异常：fc_geo_4.out_features=%s, pred_geo_4.shape[-1]=%s',
+                                      str(vg4_out), str(pred_geo_4.shape[-1]))
+                    raise SystemExit(1)
+                loss_geo_g4 = criterion(pred_geo_4.permute(0, 2, 1), label_geo_4)
 
-            loss_all.backward()
+            # 组合损失：动态权重按 geohash_precisions 与 lambda_regions
+            total_loss = loss_poi
+            for p, lam in zip(self.config.geohash_precisions, self.config.lambda_regions):
+                if lam <= 0:
+                    continue
+                if p == 5 and loss_geo_g5 is not None:
+                    total_loss = total_loss + lam * loss_geo_g5
+                elif p == 4 and loss_geo_g4 is not None:
+                    total_loss = total_loss + lam * loss_geo_g4
+
+            total_loss.backward()
             optimizer.step()
-            train_loss.append(loss_all.item())
+            train_loss.append(total_loss.item())
 
-            # update pbar
+            # update pbar（记录各项损失）
             pbar.set_description(f'Epoch [{epoch + 1}/{self.config.epochs}]')
-            pbar.set_postfix(loss=np.mean(train_loss), lr=scheduler.get_last_lr()[0])
+            postfix = {
+                'loss': float(np.mean(train_loss)),
+                'poi': float(loss_poi.item()),
+                'g5': float(loss_geo_g5.item()) if loss_geo_g5 is not None else None,
+                'g4': float(loss_geo_g4.item()) if loss_geo_g4 is not None else None,
+                'lr': scheduler.get_last_lr()[0]
+            }
+            pbar.set_postfix(**{k: v for k, v in postfix.items() if v is not None})
 
         scheduler.step()
 
@@ -118,43 +184,103 @@ class Trainer:
         val_loss, val_acc = [], []
         vbar = tqdm(val_dl, desc='valid', total=len(val_dl))
         for idx, dl in enumerate(vbar):
-            user, traj, geo, center_traj, long_traj, dt, label_traj, \
-                label_geo, negihbors_mask, traj_graph, geo_graph = dl
-            user = user.to(self.device)
-            traj = traj.to(self.device)
-            geo = geo.to(self.device)
-            center_traj = center_traj.to(self.device)
-            long_traj = long_traj.to(self.device)
-            dt = dt.to(self.device)
-            label_traj = label_traj.to(self.device)
-            label_geo = label_geo.to(self.device)
-            negihbors_mask = negihbors_mask.to(self.device)
-            traj_graph = traj_graph.to(self.device)
-            geo_graph = geo_graph.to(self.device)
+            # 兼容 batch 为 dict 或 tuple
+            if isinstance(dl, dict):
+                user = dl["user"].to(self.device)
+                traj = dl["traj"].to(self.device)
+                geo = dl["geo"].to(self.device)
+                center_traj = dl["center_traj"].to(self.device)
+                long_traj = dl["long_traj"].to(self.device)
+                dt = dl["dt"].to(self.device)
+                label_traj = dl["label_traj"].to(self.device)
+                label_geo_5 = dl["label_geo"].to(self.device)
+                label_geo_4 = dl.get("label_geo_4", None)
+                if label_geo_4 is not None:
+                    label_geo_4 = label_geo_4.to(self.device)
+                negihbors_mask = dl["negihbors_mask"].to(self.device)
+                traj_graph = dl["traj_graph"].to(self.device)
+                geo_graph = dl["geo_graph"].to(self.device)
+            else:
+                user, traj, geo, center_traj, long_traj, dt, label_traj, \
+                    label_geo, negihbors_mask, traj_graph, geo_graph = dl
+                user = user.to(self.device)
+                traj = traj.to(self.device)
+                geo = geo.to(self.device)
+                center_traj = center_traj.to(self.device)
+                long_traj = long_traj.to(self.device)
+                dt = dt.to(self.device)
+                label_traj = label_traj.to(self.device)
+                label_geo_5 = label_geo.to(self.device)
+                label_geo_4 = None
+                negihbors_mask = negihbors_mask.to(self.device)
+                traj_graph = traj_graph.to(self.device)
+                geo_graph = geo_graph.to(self.device)
 
-            pred = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
-                         geo_graph)
-            is_pred_tuple = False
-            if isinstance(pred, tuple):
-                pred, pred_geo = pred
-                is_pred_tuple = True
-            if self.config.mask:
+            outputs = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
+                            geo_graph)
+            if isinstance(outputs, tuple):
+                pred_traj = outputs[0]
+                pred_geo_5 = outputs[1]
+            else:
+                pred_traj = outputs
+                pred_geo_5 = None
+
+            pred_geo_4 = None
+            if isinstance(outputs, tuple) and len(outputs) >= 3 and isinstance(outputs[2], dict):
+                pred_regions = outputs[2]
+                pred_geo_4 = pred_regions.get("G4", None)
+            else:
+                pred_regions = getattr(model, "pred_regions", None)
+                if isinstance(pred_regions, dict):
+                    pred_geo_4 = pred_regions.get("G4", None)
+
+            if hasattr(self.config, 'mask') and self.config.mask:
                 negihbors_mask = negihbors_mask.unsqueeze(1).repeat(
                     1, self.config.max_sequence_length, 1)
-                pred.masked_fill_(negihbors_mask, -1000)
+                pred_traj.masked_fill_(negihbors_mask, -1000)
 
-            loss_all = criterion(pred.permute(0, 2, 1), label_traj)
-            if is_pred_tuple:
-                loss_geo = criterion(pred_geo.permute(0, 2, 1), label_geo)
-                loss_all = loss_all + loss_geo * self.config.loss_rate
+            loss_poi = criterion(pred_traj.permute(0, 2, 1), label_traj)
+            loss_geo_g5 = None
+            loss_geo_g4 = None
+            if pred_geo_5 is not None:
+                loss_geo_g5 = criterion(pred_geo_5.permute(0, 2, 1), label_geo_5)
+            if hasattr(self.config, 'geohash_precisions') and (4 in self.config.geohash_precisions):
+                if label_geo_4 is None:
+                    self.logger.error('[ERROR] 缺少 label_geo_4。请检查数据缓存是否包含 geohash_id_4。')
+                    raise SystemExit(1)
+                if pred_geo_4 is None:
+                    self.logger.error('[ERROR] 缺少 pred_geo_4。请检查模型是否正确提供 G4 区域头。')
+                    raise SystemExit(1)
+                vg4_out = getattr(getattr(model, 'fc_geo_4', None), 'out_features', None)
+                if vg4_out is None or vg4_out != pred_geo_4.shape[-1]:
+                    self.logger.error('[ERROR] G4 词表尺寸异常：fc_geo_4.out_features=%s, pred_geo_4.shape[-1]=%s',
+                                      str(vg4_out), str(pred_geo_4.shape[-1]))
+                    raise SystemExit(1)
+                loss_geo_g4 = criterion(pred_geo_4.permute(0, 2, 1), label_geo_4)
 
-            val_acc.append(calculate_acc(pred, label_traj))
-            val_loss.append(loss_all.item())
+            total_loss = loss_poi
+            for p, lam in zip(self.config.geohash_precisions, self.config.lambda_regions):
+                if lam <= 0:
+                    continue
+                if p == 5 and loss_geo_g5 is not None:
+                    total_loss = total_loss + lam * loss_geo_g5
+                elif p == 4 and loss_geo_g4 is not None:
+                    total_loss = total_loss + lam * loss_geo_g4
+
+            val_acc.append(calculate_acc(pred_traj, label_traj))
+            val_loss.append(total_loss.item())
 
             # update pbar
             mean_acc = torch.concat(val_acc, dim=1).mean(dim=1).cpu().tolist()
             mean_acc = [round(acc, 4) for acc in mean_acc]
-            vbar.set_postfix(val_loss=f'{np.mean(val_loss):.4f}', acc=mean_acc)
+            postfix = {
+                'val_loss': f'{np.mean(val_loss):.4f}',
+                'poi': float(loss_poi.item()),
+                'g5': float(loss_geo_g5.item()) if loss_geo_g5 is not None else None,
+                'g4': float(loss_geo_g4.item()) if loss_geo_g4 is not None else None,
+                'acc': mean_acc
+            }
+            vbar.set_postfix(**{k: v for k, v in postfix.items() if v is not None})
 
     @torch.no_grad()
     def test(self, model, dataloader, model_path):
@@ -169,30 +295,44 @@ class Trainer:
         tbar = tqdm(test_dl, desc='test', total=len(test_dl))
         self.logger.info('start testing...')
         for idx, dl in enumerate(tbar):
-            user, traj, geo, center_traj, long_traj, dt, label_traj, \
-                label_geo, negihbors_mask, traj_graph, geo_graph = dl
-            user = user.to(self.device)
-            traj = traj.to(self.device)
-            geo = geo.to(self.device)
-            center_traj = center_traj.to(self.device)
-            long_traj = long_traj.to(self.device)
-            dt = dt.to(self.device)
-            label_traj = label_traj.to(self.device)
-            label_geo = label_geo.to(self.device)
-            negihbors_mask = negihbors_mask.to(self.device)
-            traj_graph = traj_graph.to(self.device)
-            geo_graph = geo_graph.to(self.device)
+            # 兼容 batch 为 dict 或 tuple（测试保持主指标不变）
+            if isinstance(dl, dict):
+                user = dl["user"].to(self.device)
+                traj = dl["traj"].to(self.device)
+                geo = dl["geo"].to(self.device)
+                center_traj = dl["center_traj"].to(self.device)
+                long_traj = dl["long_traj"].to(self.device)
+                dt = dl["dt"].to(self.device)
+                label_traj = dl["label_traj"].to(self.device)
+                negihbors_mask = dl["negihbors_mask"].to(self.device)
+                traj_graph = dl["traj_graph"].to(self.device)
+                geo_graph = dl["geo_graph"].to(self.device)
+            else:
+                user, traj, geo, center_traj, long_traj, dt, label_traj, \
+                    label_geo, negihbors_mask, traj_graph, geo_graph = dl
+                user = user.to(self.device)
+                traj = traj.to(self.device)
+                geo = geo.to(self.device)
+                center_traj = center_traj.to(self.device)
+                long_traj = long_traj.to(self.device)
+                dt = dt.to(self.device)
+                label_traj = label_traj.to(self.device)
+                negihbors_mask = negihbors_mask.to(self.device)
+                traj_graph = traj_graph.to(self.device)
+                geo_graph = geo_graph.to(self.device)
 
-            pred = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
-                         geo_graph)
-            if isinstance(pred, tuple):
-                pred, pred_geo = pred
-            if self.config.mask:
+            outputs = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
+                            geo_graph)
+            if isinstance(outputs, tuple):
+                pred_traj = outputs[0]
+            else:
+                pred_traj = outputs
+            if hasattr(self.config, 'mask') and self.config.mask:
                 negihbors_mask = negihbors_mask.unsqueeze(1).repeat(
                     1, self.config.max_sequence_length, 1)
-                pred.masked_fill_(negihbors_mask, -1000)
+                pred_traj.masked_fill_(negihbors_mask, -1000)
 
-            test_acc.append(calculate_acc(pred, label_traj))
+            test_acc.append(calculate_acc(pred_traj, label_traj))
             # update pbar
             mean_acc = torch.concat(test_acc, dim=1).mean(dim=1).cpu().tolist()
             mean_acc = [round(acc, 4) for acc in mean_acc]
