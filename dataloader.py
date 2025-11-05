@@ -121,6 +121,15 @@ class Poidataloader():
         setattr(self.config, 'max_geo_num', int(self.dataset_static[2]))
         # Phase-0: 在静态参数加载完成后，若启用 G4，则检测并设置 G4 词表大小（V_G4）
         if 4 in self.config.geohash_precisions:
+            # [↓ 修复逻辑 ↓]
+            if not hasattr(self, 'checkins') or self.checkins is None:
+                checkins_pkl = self.database / f'checkins_{self.config.dataset}.pkl'
+                if not checkins_pkl.exists():
+                    raise SystemExit('[ERROR] geohash_id_4 missing. Please rebuild cache with G4 enabled.')
+                import pandas as pd
+                self.checkins = pd.read_pickle(checkins_pkl)
+            # [↑ 修复逻辑 ↑]
+            
             if 'geohash_id_4' not in self.checkins.columns:
                 raise SystemExit('[ERROR] geohash_id_4 missing. Please rebuild cache with G4 enabled.')
             v_g4 = int(self.checkins['geohash_id_4'].nunique()) + 1
