@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch_geometric.nn import GCNConv, global_mean_pool
+import logging
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -227,6 +228,25 @@ class PoiModel(nn.Module):
         self.ShortTermEncoder = ShortTermEncoder(config.hidden_size)
         self.fc_traj = nn.Linear(config.hidden_size * 2, config.max_loc_num)
         self.fc_geo = nn.Linear(config.hidden_size * 2, config.max_geo_num)
+        # Phase-0: 新增 G4 区域头（词表大小与现有获取方式保持一致来源，不做硬编码）
+        # 优先从配置中读取 G4 词表大小；若无，则与 G5 一致，以保持可构建性
+        vg4 = getattr(config, 'max_geo_num_4', None)
+        if vg4 is None:
+            vg4 = getattr(config, 'max_geo_num', None)
+        try:
+            self.vocab_size_geo_4 = int(vg4) if vg4 is not None else None
+        except Exception:
+            self.vocab_size_geo_4 = None
+        # 始终构建对象以满足“未启用也可构建”的护栏；未启用时不在 forward 中使用
+        self.fc_geo_4 = nn.Linear(config.hidden_size * 2,
+                                  self.vocab_size_geo_4 if self.vocab_size_geo_4 is not None else config.max_geo_num)
+        # 初始化日志：打印一次 G4 头词表大小（若启用）
+        try:
+            if hasattr(config, 'geohash_precisions') and 4 in config.geohash_precisions:
+                logging.getLogger().info('检测到 G4 头，V_G4=%d',
+                                         self.vocab_size_geo_4 if self.vocab_size_geo_4 is not None else config.max_geo_num)
+        except Exception:
+            pass
 
     def forward(self, user, traj, geo, center_traj, long_traj, dt, traj_graph, geo_graph):
         # user/traj/geo shape: (batch_size, max_sequence_length)
@@ -248,8 +268,21 @@ class PoiModel(nn.Module):
                                               user_perfence, dt)
 
         # pred_traj shape: (batch_size, max_sequence_length, max_loc_num)
-        # pred_geo shape: (batch_size, max_sequence_length, max_geo_num)
+        # pred_geo(G5) shape: (batch_size, max_sequence_length, max_geo_num)
         pred_traj = self.fc_traj(short_enc_out)
         pred_geo = self.fc_geo(short_enc_out)
+
+        # Phase-0: 并联产生 pred_geo_4（不改变主干与现有返回，不参与任何注意力/融合/归一化）
+        pred_geo_4 = None
+        if hasattr(self.config, 'geohash_precisions') and 4 in self.config.geohash_precisions:
+            pred_geo_4 = self.fc_geo_4(short_enc_out)
+
+        # 侧带记录：供后续训练阶段读取（保持 forward 原返回结构向后兼容）
+        try:
+            self.pred_regions = {"G5": pred_geo}
+            if pred_geo_4 is not None:
+                self.pred_regions["G4"] = pred_geo_4
+        except Exception:
+            pass
 
         return pred_traj, pred_geo
