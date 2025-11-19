@@ -53,8 +53,7 @@ def get_args():
     parser.add_argument('--lambda_regions',
                         nargs='+',
                         type=float,
-                        # required=True,
-                        default=[0.8],
+                        default=[0.2],
                         help='Region loss weights aligned with geohash_precisions; single value will broadcast')
     parser.add_argument('--use_warmup',
                         type=int,
@@ -63,8 +62,35 @@ def get_args():
                         help='Enable warm-up (0/1)')
     parser.add_argument('--warmup_epochs',
                         type=int,
-                        default=10,
+                        default=2,
                         help='Warm-up epochs (placeholder when use_warmup=0)')
+    parser.add_argument('--use_fusion_short',
+                        type=int,
+                        choices=[0, 1],
+                        default=0,
+                        help='Enable LiteFusion on short-term branch (0/1)')
+    parser.add_argument('--use_fusion_long',
+                        type=int,
+                        choices=[0, 1],
+                        default=0,
+                        help='Enable LiteFusion on long-term branch (0/1)')
+    parser.add_argument('--share_gcn_weights',
+                        type=int,
+                        choices=[0, 1],
+                        default=0,
+                        help='Share traj/geohash GCN weights in LocalCenterEncoder (0/1)')
+    parser.add_argument('--fusion_init_bias',
+                        type=str,
+                        default='g5-dominant',
+                        help='LiteFusion weight init bias strategy')
+    parser.add_argument('--fusion_lr_scale',
+                        type=float,
+                        default=0.3,
+                        help='LR scale for Fusion parameter group during warm-up')
+    parser.add_argument('--fusion_dropout',
+                        type=float,
+                        default=0.1,
+                        help='Dropout rate inside LiteFusion')
     args = parser.parse_args()
     args.model_path = Path(args.model_path)
     args.model_dir = Path(args.model_dir)
@@ -78,4 +104,27 @@ def get_args():
         args.dataset_file = './Datasets/checkins-4sq.txt'
     elif args.dataset == 'Yelp':
         args.dataset_file = './Datasets/checkins-yelp.txt'
+    try:
+        assert 5 in args.geohash_precisions
+    except AssertionError:
+        raise SystemExit('Assertion failed: geohash_precisions must include 5 (G5 as NNS anchor).')
+    try:
+        assert len(args.lambda_regions) == len(args.geohash_precisions)
+    except AssertionError:
+        raise SystemExit('Assertion failed: lambda_regions length must equal geohash_precisions length.')
+    try:
+        levels_str = ','.join([f'G{p}' for p in args.geohash_precisions])
+        lambda_map_str = ', '.join([f'λ(G{p})={args.lambda_regions[i]:.2f}' for i, p in enumerate(args.geohash_precisions)])
+        print(f'[Args] geohash_precisions: {levels_str}')
+        print(f'[Args] lambda_regions: {lambda_map_str}')
+        print(f'[Args] use_fusion_short: {int(args.use_fusion_short)}')
+        print(f'[Args] use_fusion_long: {int(args.use_fusion_long)}')
+        print(f'[Args] share_gcn_weights: {int(args.share_gcn_weights)}')
+        print(f'[Args] fusion_init_bias: {str(args.fusion_init_bias)}')
+        print(f'[Args] fusion_lr_scale: {float(args.fusion_lr_scale)}')
+        print(f'[Args] fusion_dropout: {float(args.fusion_dropout)}')
+        print(f'[Args] use_warmup: {int(args.use_warmup)}')
+        print(f'[Args] warmup_epochs: {int(args.warmup_epochs)}')
+    except Exception:
+        pass
     return args

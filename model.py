@@ -93,6 +93,36 @@ class GCN(torch.nn.Module):
         return x
 
 
+class LiteFusion(nn.Module):
+
+    def __init__(self, num_inputs, d_model, dropout, init_bias='g5-dominant'):
+        super().__init__()
+        self.weights = nn.Parameter(torch.ones(num_inputs))
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(num_inputs)])
+        self.dropout = nn.Dropout(dropout)
+        if isinstance(init_bias, str) and init_bias == 'g5-dominant':
+            if num_inputs >= 1:
+                with torch.no_grad():
+                    self.weights.fill_(0.1)
+                    idx = 1 if num_inputs >= 2 else 0
+                    self.weights[idx] = 2.0
+
+    def forward(self, x_list):
+        assert len(x_list) == len(self.norms)
+        xs = []
+        for i, x in enumerate(x_list):
+            x = self.norms[i](x)
+            x = self.dropout(x)
+            xs.append(x)
+        pi = torch.softmax(self.weights, dim=0)
+        out = None
+        for i, x in enumerate(xs):
+            w = pi[i]
+            xw = x * w
+            out = xw if out is None else out + xw
+        return out
+
+
 class EmbeddingLayer(nn.Module):
 
     def __init__(self, config):
@@ -108,8 +138,24 @@ class EmbeddingLayer(nn.Module):
         nn.init.normal_(self.userEmbLayer.weight, std=0.1)
         nn.init.normal_(self.locEmbLayer.weight, std=0.1)
         nn.init.normal_(self.geoEmbLayer.weight, std=0.1)
+        self.geo_embs = nn.ModuleDict()
+        p_list = getattr(config, 'geohash_precisions', [5])
+        vocab_map = getattr(config, 'geo_vocab_size', {})
+        for p in p_list:
+            ip = int(p)
+            if ip == 5:
+                self.geo_embs[str(ip)] = self.geoEmbLayer
+                continue
+            v = vocab_map.get(ip, None)
+            if v is None:
+                v = getattr(config, f'max_geo_num_{ip}', None)
+            if v is None:
+                v = getattr(config, 'max_geo_num', None)
+            emb = nn.Embedding(int(v), config.hidden_size, 0)
+            nn.init.normal_(emb.weight, std=0.1)
+            self.geo_embs[str(ip)] = emb
 
-    def forward(self, user, traj, geo, long_traj, traj_graph, geo_graph):
+    def forward(self, user, traj, geo, long_traj, traj_graph, geo_graph, geo_seqs=None):
         #! Embedding user, traj, geohash
         # emb shape: (batch_size, max_sequence_length, hidden_size)
         user_emb = self.userEmbLayer(user)
@@ -120,6 +166,12 @@ class EmbeddingLayer(nn.Module):
 
         traj_graph.x = self.locEmbLayer(traj_graph.x)
         geo_graph.x = self.geoEmbLayer(geo_graph.x)
+        if geo_seqs is not None:
+            geo_emb_dict = {}
+            for p, seq in geo_seqs.items():
+                emb_layer = self.geo_embs.get(str(int(p)), self.geoEmbLayer)
+                geo_emb_dict[int(p)] = emb_layer(seq)
+            self.geo_emb_dict = geo_emb_dict
 
         return user_emb, traj_emb, geo_emb, long_traj_emb, traj_graph, geo_graph
 
@@ -128,12 +180,18 @@ class LocalCenterEncoder(nn.Module):
 
     def __init__(self, d_model, n_heads=4, dropout=0.5):
         super(LocalCenterEncoder, self).__init__()
+        self.d_model = d_model
         self.traj_conv = GCN(d_model, 3)
         self.geo_conv = GCN(d_model, 3)
+        self.gcn_modules = nn.ModuleDict()
+        self.gcn_modules['5'] = self.geo_conv
         self.attn = nn.MultiheadAttention(d_model * 2, n_heads, dropout, batch_first=True)
         self.linear = nn.Linear(d_model * 2, d_model)
         self.dropout1 = nn.Dropout()
         self.dropout2 = nn.Dropout()
+        self._init_done = False
+        self._log_once = False
+        self.lite_fusion_long = None
 
     def forward(self, center_traj, traj_graph, geo_graph):
         # center_traj shape: (batch_size, long_sequence_length)
@@ -152,7 +210,61 @@ class LocalCenterEncoder(nn.Module):
         sub_geo_graph = geo_graph.subgraph(geo_graph.freq >= geo_graph.thr)
         # traj_personal/geo_personal shape: (batch_size, d_model)
         traj_personal = global_mean_pool(sub_traj_graph.x, sub_traj_graph.batch)
-        geo_personal = global_mean_pool(sub_geo_graph.x, sub_geo_graph.batch)
+        precisions = sorted(set([int(x) for x in getattr(self, 'geohash_precisions', [5])]))
+        if not self._init_done:
+            share = int(getattr(self, 'share_gcn_weights', 0))
+            first = None
+            for i, p in enumerate(precisions):
+                key = str(p)
+                if p == 5:
+                    self.gcn_modules[key] = self.geo_conv
+                    first = self.geo_conv
+                else:
+                    if share == 1 and first is not None:
+                        self.gcn_modules[key] = first
+                    else:
+                        self.gcn_modules[key] = GCN(self.d_model, 3)
+            num_inputs = len(precisions)
+            drop = float(getattr(self, 'fusion_dropout', 0.1))
+            bias = getattr(self, 'fusion_init_bias', 'g5-dominant')
+            self.lite_fusion_long = LiteFusion(num_inputs, self.d_model, drop, bias)
+            self._init_done = True
+
+        graphs_p = getattr(geo_graph, 'graphs_p', None)
+        vec_list = []
+        for p in precisions:
+            if p == 5:
+                g = geo_graph
+            else:
+                g = graphs_p.get(p) if isinstance(graphs_p, dict) else None
+            if g is None:
+                vec_list.append(global_mean_pool(sub_geo_graph.x, sub_geo_graph.batch))
+            else:
+                gc = self.gcn_modules.get(str(p), self.geo_conv)
+                gout = gc(g.x, g.edge_index)
+                g.x = gout
+                sg = g.subgraph(g.freq >= g.thr)
+                vec_list.append(global_mean_pool(sg.x, sg.batch))
+
+        use_fusion_long = int(getattr(self, 'use_fusion_long', 0))
+        if not self._log_once:
+            assert 5 in precisions
+            if use_fusion_long == 0:
+                logging.getLogger().info('[long] fallback=G5')
+            else:
+                pi = torch.softmax(self.lite_fusion_long.weights, dim=0).detach().cpu().tolist()
+                logging.getLogger().info('[long] fusion_pi=%s', str(pi))
+            self._log_once = True
+
+        if use_fusion_long == 1 and self.lite_fusion_long is not None:
+            geo_vec = self.lite_fusion_long(vec_list)
+        else:
+            try:
+                idx = precisions.index(5)
+            except Exception:
+                idx = 0
+            geo_vec = vec_list[idx] if len(vec_list) > idx else global_mean_pool(sub_geo_graph.x, sub_geo_graph.batch)
+        geo_personal = geo_vec
 
         # traj_personal/geo_personal shape: (batch_size, 1, d_model)
         traj_personal = traj_personal.unsqueeze(1)
@@ -179,6 +291,9 @@ class ShortTermEncoder(nn.Module):
         self.w = nn.Parameter(torch.ones(2))
         self.dropout1 = nn.Dropout()
         self.dropout2 = nn.Dropout()
+        self.lite_fusion_short = None
+        self._init_short = False
+        self._log_once_short = False
 
     def forward(self, user_emb, traj_emb, geo_emb, center_traj_emb, long_traj_emb,
                 user_perfence, dt):
@@ -188,12 +303,48 @@ class ShortTermEncoder(nn.Module):
         # user_perfence shape: (batch_size, 1, d_model * 2)
         # dt shape: (batch_size, max_sequence_length, max_sequence_length)
 
-        # user_perfence shape: (batch_size, max_sequence_length, d_model)
+        precisions = sorted(set([int(x) for x in getattr(self, 'geohash_precisions', [5])]))
+        if not self._init_short:
+            num_inputs = len(precisions)
+            drop = float(getattr(self, 'fusion_dropout', 0.1))
+            bias = getattr(self, 'fusion_init_bias', 'g5-dominant')
+            self.lite_fusion_short = LiteFusion(num_inputs, int(traj_emb.size(-1)), drop, bias)
+            self._init_short = True
+        use_fusion_short = int(getattr(self, 'use_fusion_short', 0))
+        if not self._log_once_short:
+            assert 5 in precisions
+            if use_fusion_short == 0:
+                logging.getLogger().info('[short] fallback=G5')
+            else:
+                pi = torch.softmax(self.lite_fusion_short.weights, dim=0).detach().cpu().tolist()
+                logging.getLogger().info('[short] fusion_pi=%s', str(pi))
+            self._log_once_short = True
+
+        fused_geo = None
+        if isinstance(geo_emb, dict):
+            emb_list = []
+            for p in precisions:
+                t = geo_emb.get(int(p), None)
+                if t is None and p == 5 and not fused_geo is not None:
+                    t = geo_emb.get(5, None)
+                if t is None:
+                    t = geo_emb.get(5, None)
+                emb_list.append(t)
+            if use_fusion_short == 1 and self.lite_fusion_short is not None:
+                fused_geo = self.lite_fusion_short(emb_list)
+            else:
+                try:
+                    fused_geo = emb_list[precisions.index(5)]
+                except Exception:
+                    fused_geo = emb_list[0]
+        else:
+            fused_geo = geo_emb
+
         user_perfence = user_perfence.repeat(1, traj_emb.size(1), 1)
         user_perfence = torch.concat([user_emb, user_perfence], dim=-1)
 
         # input shape: (batch_size, max_sequence_length, d_model * 4)
-        input = torch.concat([traj_emb, geo_emb, user_perfence], dim=-1)
+        input = torch.concat([traj_emb, fused_geo, user_perfence], dim=-1)
 
         # lstm_output shape: (batch_size, max_sequence_length, hidden_size)
         lstm_output, (hidden_state, cell_state) = self.lstm(input)

@@ -45,6 +45,10 @@ class PoiDataset(Dataset):
             traj.extend(df['location_id'].values)
             time.extend(df['time_unix'].values)
             geo.extend(df['geohash_id'].values)
+            for p in getattr(self.config, 'geohash_precisions', [5]):
+                colp = 'geohash_id' if int(p) == 5 else f'geohash_id_{int(p)}'
+                if colp in df.columns:
+                    geo_dict[int(p)].extend(df[colp].values)
 
             cur_user = df.iloc[0]['user_id']
             # Create a user-poi graph and record the interval of the last visit to a location
@@ -52,6 +56,12 @@ class PoiDataset(Dataset):
                                                           self.config.alpha)
             geo_graph[cur_user] = self.create_freq_graph(df['geohash_id'].values, 'geo',
                                                          self.config.beta)
+            graphs_p = {}
+            for p in getattr(self.config, 'geohash_precisions', [5]):
+                colp = 'geohash_id' if int(p) == 5 else f'geohash_id_{int(p)}'
+                if colp in df.columns:
+                    graphs_p[int(p)] = self.create_freq_graph(df[colp].values, 'geo', self.config.beta)
+            geo_graphs[cur_user] = graphs_p
 
             # Create local center sequence
             center_traj.extend(
@@ -62,12 +72,16 @@ class PoiDataset(Dataset):
         user_start_ptr, batch_ptr, batch_length = [], [], []
         center_traj = []
         traj_graph, geo_graph = {}, {}
+        geo_dict = {int(p): [] for p in getattr(self.config, 'geohash_precisions', [5])}
+        geo_graphs = {}
         _ = self.checkins.groupby('user_id').apply(collect_fn)
 
         self.user, self.traj, self.time, self.geo = LT(user), LT(traj), LT(time), LT(geo)
         self.user_start_ptr, self.batch_ptr, self.batch_length = user_start_ptr, batch_ptr, batch_length
         self.center_traj = LT(center_traj)
         self.traj_graph, self.geo_graph = traj_graph, geo_graph
+        self.geo_dict = {p: LT(seq) for p, seq in geo_dict.items()}
+        self.geo_graphs = geo_graphs
 
         if self.knn:
             loc2lat, loc2lon, _ = self.mapping
@@ -206,6 +220,22 @@ class PoiDataset(Dataset):
             "traj_graph": traj_graph,
             "geo_graph": geo_graph,
         }
+
+        geo_seqs = {}
+        geo_graphs_sample = {}
+        for p in getattr(self.config, 'geohash_precisions', [5]):
+            seq_p = self.geo_dict.get(int(p), None)
+            graphs_p = self.geo_graphs.get(int(user[0]), {})
+            if seq_p is not None:
+                seq_slice = seq_p[start:end]
+                if len(user) != self.config.max_sequence_length:
+                    padding_length = self.config.max_sequence_length - len(user)
+                    seq_slice = F.pad(seq_slice, [0, padding_length])
+                geo_seqs[int(p)] = seq_slice
+            if isinstance(graphs_p, dict) and int(p) in graphs_p:
+                geo_graphs_sample[int(p)] = graphs_p[int(p)]
+        sample["geo_seqs"] = geo_seqs
+        sample["geo_graphs"] = geo_graphs_sample
 
         # 若启用 G4：严格校验缓存并生成 label_geo_4；否则不返回该键
         if hasattr(self.config, 'geohash_precisions') and 4 in self.config.geohash_precisions:

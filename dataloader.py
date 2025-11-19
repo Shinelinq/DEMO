@@ -26,8 +26,13 @@ class Poidataloader():
         setattr(self.config, 'max_user_num', self.user_count() + 1)
         setattr(self.config, 'max_loc_num', self.location_count() + 1)
         setattr(self.config, 'max_geo_num', self.geohash_count() + 1)
-        # Phase-0: 在数据加载完成后，若启用 G4，则检测并设置 G4 词表大小（V_G4）
-        if 4 in self.config.geohash_precisions:
+        geo_vocab = {}
+        for p in getattr(self.config, 'geohash_precisions', [5]):
+            col = 'geohash_id' if p == 5 else f'geohash_id_{p}'
+            if col in self.checkins.columns:
+                geo_vocab[int(p)] = int(self.checkins[col].nunique()) + 1
+        setattr(self.config, 'geo_vocab_size', geo_vocab)
+        if 4 in getattr(self.config, 'geohash_precisions', []):
             if 'geohash_id_4' not in self.checkins.columns:
                 raise SystemExit('[ERROR] geohash_id_4 missing. Please rebuild cache with G4 enabled.')
             v_g4 = int(self.checkins['geohash_id_4'].nunique()) + 1
@@ -166,9 +171,11 @@ class Poidataloader():
         checkins = checkins.dropna().drop_duplicates()
         checkins.reset_index(drop=True, inplace=True)
         checkins = utils.geohash_encode(checkins)
-        # 生成 G4 字段（使用相同编码接口），作为新增缓存列
-        checkins_g4 = utils.geohash_encode(checkins.copy(), precision=4)
-        checkins['geohash_4'] = checkins_g4['geohash']
+        for p in getattr(self.config, 'geohash_precisions', [5]):
+            if int(p) == 5:
+                continue
+            cp = utils.geohash_encode(checkins.copy(), precision=int(p))
+            checkins[f'geohash_{int(p)}'] = cp['geohash']
         checkins = self.__convert(checkins)
         checkins.to_pickle(self.database / f'checkins_{dataset}.pkl')
         return checkins
@@ -187,9 +194,13 @@ class Poidataloader():
         checkins, user2id = item2id(checkins, 'user')
         checkins, location2id = item2id(checkins, 'location')
         checkins, geohash2id = item2id(checkins, 'geohash')
-        # 为 G4 创建全局 id，并统一列名为 geohash_id_4
-        checkins, geohash4_2id = item2id(checkins, 'geohash_4')
-        checkins.rename(columns={'geohash_4_id': 'geohash_id_4'}, inplace=True)
+        for p in getattr(self.config, 'geohash_precisions', [5]):
+            if int(p) == 5:
+                continue
+            col = f'geohash_{int(p)}'
+            if col in checkins.columns:
+                checkins, _ = item2id(checkins, col)
+                checkins.rename(columns={f'{col}_id': f'geohash_id_{int(p)}'}, inplace=True)
         # time -> time_unix
         checkins.insert(checkins.shape[1], 'time_unix',
                         checkins['time'].astype('int') // 10**9)
