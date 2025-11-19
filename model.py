@@ -347,6 +347,8 @@ class ShortTermEncoder(nn.Module):
             drop = float(getattr(self, 'fusion_dropout', 0.1))
             bias = getattr(self, 'fusion_init_bias', 'g5-dominant')
             self.lite_fusion_short = LiteFusion(num_inputs, int(traj_emb.size(-1)), drop, bias)
+            device = traj_emb.device
+            self.lite_fusion_short.to(device)
             self._init_short = True
         use_fusion_short = int(getattr(self, 'use_fusion_short', 0))
         if not self._log_once_short:
