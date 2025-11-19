@@ -166,6 +166,23 @@ class EmbeddingLayer(nn.Module):
 
         traj_graph.x = self.locEmbLayer(traj_graph.x)
         geo_graph.x = self.geoEmbLayer(geo_graph.x)
+        if hasattr(geo_graph, 'graphs_p') and isinstance(getattr(geo_graph, 'graphs_p'), dict):
+            keys_embedded = []
+            dev = getattr(geo_graph.x, 'device', None)
+            for p, g in geo_graph.graphs_p.items():
+                key = str(int(p))
+                if key not in self.geo_embs:
+                    logging.getLogger().error('[embed] missing embedding table for G%s', key)
+                    raise KeyError(f'missing embedding for precision {key}')
+                emb_layer = self.geo_embs[key]
+                g.x = emb_layer(g.x.to(dtype=torch.long, device=dev))
+                keys_embedded.append(int(p))
+            if not hasattr(self, '_embed_log_done') or not self._embed_log_done:
+                try:
+                    logging.getLogger().info('[embed] graphs_p embedded for keys: %s', str(keys_embedded))
+                except Exception:
+                    pass
+                self._embed_log_done = True
         if geo_seqs is not None:
             geo_emb_dict = {}
             for p, seq in geo_seqs.items():

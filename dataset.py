@@ -20,6 +20,7 @@ class PoiDataset(Dataset):
         self.checkins = checkins
         self.mapping = mapping
         self.knn = False
+        self._log_batch_once = False
 
         self.checkins_split()
 
