@@ -71,7 +71,10 @@ class Trainer:
                     dt = dt.to(self.device)
                     traj_graph = traj_graph.to(self.device)
                     geo_graph = geo_graph.to(self.device)
-                _ = model(user, traj, geo, center_traj, long_traj, dt, traj_graph, geo_graph)
+                geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+                if isinstance(dl, dict) and "geo_graphs" in dl:
+                    setattr(geo_graph, "graphs_p", dl["geo_graphs"])
+                _ = model(user, traj, geo, center_traj, long_traj, dt, traj_graph, geo_graph, geo_seqs=geo_seqs)
             except Exception:
                 pass
 
@@ -165,8 +168,11 @@ class Trainer:
                 geo_graph = geo_graph.to(self.device)
 
             optimizer.zero_grad()
+            geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+            if isinstance(dl, dict) and "geo_graphs" in dl:
+                setattr(geo_graph, "graphs_p", dl["geo_graphs"])
             outputs = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
-                            geo_graph)
+                            geo_graph, geo_seqs=geo_seqs)
             if isinstance(outputs, tuple):
                 pred_traj = outputs[0]
                 pred_geo_5 = outputs[1]
@@ -260,8 +266,11 @@ class Trainer:
                 traj_graph = traj_graph.to(self.device)
                 geo_graph = geo_graph.to(self.device)
 
+            geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+            if isinstance(dl, dict) and "geo_graphs" in dl:
+                setattr(geo_graph, "graphs_p", dl["geo_graphs"])
             outputs = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
-                            geo_graph)
+                            geo_graph, geo_seqs=geo_seqs)
             if isinstance(outputs, tuple):
                 pred_traj = outputs[0]
                 pred_geo_5 = outputs[1]
@@ -353,8 +362,11 @@ class Trainer:
                 traj_graph = traj_graph.to(self.device)
                 geo_graph = geo_graph.to(self.device)
 
+            geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+            if isinstance(dl, dict) and "geo_graphs" in dl:
+                setattr(geo_graph, "graphs_p", dl["geo_graphs"])
             outputs = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
-                            geo_graph)
+                            geo_graph, geo_seqs=geo_seqs)
             if isinstance(outputs, tuple):
                 pred_traj = outputs[0]
             else:

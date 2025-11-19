@@ -377,6 +377,13 @@ class PoiModel(nn.Module):
         self.EmbeddingLayer = EmbeddingLayer(config)
         self.LocalCenterEncoder = LocalCenterEncoder(config.hidden_size)
         self.ShortTermEncoder = ShortTermEncoder(config.hidden_size)
+        for m in (self.LocalCenterEncoder, self.ShortTermEncoder):
+            m.geohash_precisions = config.geohash_precisions
+            m.use_fusion_long = getattr(config, "use_fusion_long", 0)
+            m.use_fusion_short = getattr(config, "use_fusion_short", 0)
+            m.fusion_init_bias = getattr(config, "fusion_init_bias", "g5-dominant")
+            m.fusion_dropout = getattr(config, "fusion_dropout", 0.1)
+            m.share_gcn_weights = getattr(config, "share_gcn_weights", 0)
         self.fc_traj = nn.Linear(config.hidden_size * 2, config.max_loc_num)
         self.geo_heads = nn.ModuleDict()
         p_list = sorted(set([int(p) for p in getattr(config, 'geohash_precisions', [5])]))
@@ -390,14 +397,14 @@ class PoiModel(nn.Module):
             self.geo_heads[key] = nn.Linear(config.hidden_size * 2, out_features)
         self._heads_logged = False
 
-    def forward(self, user, traj, geo, center_traj, long_traj, dt, traj_graph, geo_graph):
+    def forward(self, user, traj, geo, center_traj, long_traj, dt, traj_graph, geo_graph, geo_seqs=None):
         # user/traj/geo shape: (batch_size, max_sequence_length)
         # center_traj/long_traj shape: (batch_size, long_sequence_length)
         # dt shape: (batch_size, max_sequence_length, max_sequence_length)
 
         # user_emb/traj_emb/geo_emb shape: (batch_size, max_sequence_length, hidden_size)
         user_emb, traj_emb, geo_emb, long_traj_emb, traj_graph, geo_graph = self.EmbeddingLayer(
-            user, traj, geo, long_traj, traj_graph, geo_graph)
+            user, traj, geo, long_traj, traj_graph, geo_graph, geo_seqs=geo_seqs)
 
         # user_perfence shape: (batch_size, 1, hidden_size)
         # center_traj_emb shape: (batch_size, long_sequence_length, hidden_size)
@@ -405,7 +412,8 @@ class PoiModel(nn.Module):
             center_traj, traj_graph, geo_graph)
 
         # short_enc_out shape: (batch_size, max_sequence_length, hidden_size)
-        short_enc_out = self.ShortTermEncoder(user_emb, traj_emb, geo_emb,
+        geo_for_short = getattr(self.EmbeddingLayer, "geo_emb_dict", None) or geo_emb
+        short_enc_out = self.ShortTermEncoder(user_emb, traj_emb, geo_for_short,
                                               center_traj_emb, long_traj_emb,
                                               user_perfence, dt)
 
