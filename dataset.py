@@ -236,6 +236,14 @@ class PoiDataset(Dataset):
                 geo_graphs_sample[int(p)] = graphs_p[int(p)]
         sample["geo_seqs"] = geo_seqs
         sample["geo_graphs"] = geo_graphs_sample
+        if not self._log_batch_once:
+            try:
+                print(f'[Data] geo_seqs.keys: {list(sample["geo_seqs"].keys())}')
+                print(f'[Data] geo_graphs.keys: {list(sample["geo_graphs"].keys())}')
+                print('[data] neighbors_mask uses G5 only')
+            except Exception:
+                pass
+            self._log_batch_once = True
 
         # 若启用 G4：严格校验缓存并生成 label_geo_4；否则不返回该键
         if hasattr(self.config, 'geohash_precisions') and 4 in self.config.geohash_precisions:

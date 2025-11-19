@@ -117,6 +117,8 @@ def get_args():
         lambda_map_str = ', '.join([f'λ(G{p})={args.lambda_regions[i]:.2f}' for i, p in enumerate(args.geohash_precisions)])
         print(f'[Args] geohash_precisions: {levels_str}')
         print(f'[Args] lambda_regions: {lambda_map_str}')
+        pairs = [(int(p), float(args.lambda_regions[i])) for i, p in enumerate(args.geohash_precisions)]
+        print(f'[Args] precision-lambda pairs: {pairs}')
         print(f'[Args] use_fusion_short: {int(args.use_fusion_short)}')
         print(f'[Args] use_fusion_long: {int(args.use_fusion_long)}')
         print(f'[Args] share_gcn_weights: {int(args.share_gcn_weights)}')

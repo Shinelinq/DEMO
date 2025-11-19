@@ -18,6 +18,7 @@ class Poidataloader():
         self.database = Path(config.database)
         if not self.database.exists():
             self.database.mkdir()
+        self._log_vocab_once = False
 
     def load(self, dataset, file):
         self.checkins = self.load_checkins(dataset, file)
@@ -32,6 +33,12 @@ class Poidataloader():
             if col in self.checkins.columns:
                 geo_vocab[int(p)] = int(self.checkins[col].nunique()) + 1
         setattr(self.config, 'geo_vocab_size', geo_vocab)
+        if not self._log_vocab_once:
+            try:
+                print(f'[Data] geo_vocab_size: {getattr(self.config, "geo_vocab_size", {})}')
+            except Exception:
+                pass
+            self._log_vocab_once = True
         if 4 in getattr(self.config, 'geohash_precisions', []):
             if 'geohash_id_4' not in self.checkins.columns:
                 raise SystemExit('[ERROR] geohash_id_4 missing. Please rebuild cache with G4 enabled.')
