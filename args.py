@@ -5,8 +5,8 @@ from pathlib import Path
 def get_args():
 
     parser = argparse.ArgumentParser(description="MARAN arguments")
-    parser.add_argument('--gpu', default=-1, type=int, help='the gpu to use')
-    parser.add_argument('--mode', default='test', type=str, help='train/test')
+    parser.add_argument('--gpu', default=0, type=int, help='the gpu to use')
+    parser.add_argument('--mode', default='train', type=str, help='train/test')
     parser.add_argument('--dataset',
                         default='Gowalla',
                         type=str,

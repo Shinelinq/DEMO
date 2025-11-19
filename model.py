@@ -186,7 +186,12 @@ class EmbeddingLayer(nn.Module):
         if geo_seqs is not None:
             geo_emb_dict = {}
             for p, seq in geo_seqs.items():
-                emb_layer = self.geo_embs.get(str(int(p)), self.geoEmbLayer)
+                # emb_layer = self.geo_embs.get(str(int(p)), self.geoEmbLayer)
+                str_p = str(int(p))
+                if str_p in self.geo_embs:
+                    emb_layer = self.geo_embs[str_p]
+                else:
+                    emb_layer = self.geoEmbLayer
                 geo_emb_dict[int(p)] = emb_layer(seq)
             self.geo_emb_dict = geo_emb_dict
 
@@ -230,21 +235,32 @@ class LocalCenterEncoder(nn.Module):
         precisions = sorted(set([int(x) for x in getattr(self, 'geohash_precisions', [5])]))
         if not self._init_done:
             share = int(getattr(self, 'share_gcn_weights', 0))
-            first = None
-            for i, p in enumerate(precisions):
-                key = str(p)
-                if p == 5:
+            ref_device = next(self.geo_conv.parameters()).device
+            self.gcn_modules = getattr(self, 'gcn_modules', nn.ModuleDict())
+            first_key = None
+            for p in precisions:
+                key = str(int(p))
+                if key == '5':
                     self.gcn_modules[key] = self.geo_conv
-                    first = self.geo_conv
+                    if first_key is None:
+                        first_key = key
                 else:
-                    if share == 1 and first is not None:
-                        self.gcn_modules[key] = first
+                    if share == 1 and first_key is not None:
+                        self.gcn_modules[key] = self.gcn_modules[first_key]
                     else:
-                        self.gcn_modules[key] = GCN(self.d_model, 3)
-            num_inputs = len(precisions)
-            drop = float(getattr(self, 'fusion_dropout', 0.1))
-            bias = getattr(self, 'fusion_init_bias', 'g5-dominant')
-            self.lite_fusion_long = LiteFusion(num_inputs, self.d_model, drop, bias)
+                        gcn = GCN(self.d_model, 3)
+                        gcn.to(ref_device)
+                        self.gcn_modules[key] = gcn
+            if int(getattr(self, 'use_fusion_long', 0)) == 1:
+                drop = float(getattr(self, 'fusion_dropout', 0.1))
+                bias = getattr(self, 'fusion_init_bias', 'g5-dominant')
+                self.lite_fusion_long = LiteFusion(
+                    num_inputs=len(precisions),
+                    d_model=self.d_model,
+                    dropout=drop,
+                    init_bias=bias
+                )
+                self.lite_fusion_long.to(ref_device)
             self._init_done = True
 
         graphs_p = getattr(geo_graph, 'graphs_p', None)
@@ -257,7 +273,12 @@ class LocalCenterEncoder(nn.Module):
             if g is None:
                 vec_list.append(global_mean_pool(sub_geo_graph.x, sub_geo_graph.batch))
             else:
-                gc = self.gcn_modules.get(str(p), self.geo_conv)
+                # gc = self.gcn_modules.get(str(p), self.geo_conv)
+                str_p = str(p)
+                if str_p in self.gcn_modules:
+                    gc = self.gcn_modules[str_p]
+                else:
+                    gc = self.geo_conv  # 回退使用默认的 G5 GCN
                 gout = gc(g.x, g.edge_index)
                 g.x = gout
                 sg = g.subgraph(g.freq >= g.thr)

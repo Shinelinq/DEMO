@@ -71,10 +71,16 @@ class Trainer:
                     dt = dt.to(self.device)
                     traj_graph = traj_graph.to(self.device)
                     geo_graph = geo_graph.to(self.device)
-                geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+                # --- [dry-run 修复开始] ---
                 if isinstance(dl, dict) and "geo_graphs" in dl:
-                    setattr(geo_graph, "graphs_p", dl["geo_graphs"])
+                    graphs_p = {p: g.to(self.device) for p, g in dl["geo_graphs"].items()}
+                    setattr(geo_graph, "graphs_p", graphs_p)
+                geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+                if isinstance(geo_seqs, dict):
+                    dev = self.device
+                    geo_seqs = {int(p): t.to(device=dev, dtype=torch.long) for p, t in geo_seqs.items()}
                 _ = model(user, traj, geo, center_traj, long_traj, dt, traj_graph, geo_graph, geo_seqs=geo_seqs)
+                # --- [dry-run 修复结束] ---
             except Exception:
                 pass
 
@@ -168,9 +174,19 @@ class Trainer:
                 geo_graph = geo_graph.to(self.device)
 
             optimizer.zero_grad()
-            geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+            # 1. 处理图数据：先移到 GPU，再挂载
             if isinstance(dl, dict) and "geo_graphs" in dl:
+                for p in dl["geo_graphs"]:
+                    # 关键：把字典里的每个图对象移到 device
+                    dl["geo_graphs"][p] = dl["geo_graphs"][p].to(self.device)
                 setattr(geo_graph, "graphs_p", dl["geo_graphs"])
+
+            # 2. 处理序列数据：获取，移到 GPU，转为 long
+            geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+            if geo_seqs is not None:
+                for p in geo_seqs:
+                    # 关键：把字典里的每个 Tensor 移到 device
+                    geo_seqs[p] = geo_seqs[p].to(device=self.device, dtype=torch.long)
             outputs = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
                             geo_graph, geo_seqs=geo_seqs)
             if isinstance(outputs, tuple):
@@ -266,9 +282,20 @@ class Trainer:
                 traj_graph = traj_graph.to(self.device)
                 geo_graph = geo_graph.to(self.device)
 
-            geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+            # 1. 处理图数据：先移到 GPU，再挂载
             if isinstance(dl, dict) and "geo_graphs" in dl:
+                for p in dl["geo_graphs"]:
+                    # 关键：把字典里的每个图对象移到 device
+                    dl["geo_graphs"][p] = dl["geo_graphs"][p].to(self.device)
                 setattr(geo_graph, "graphs_p", dl["geo_graphs"])
+
+            # 2. 处理序列数据：获取，移到 GPU，转为 long
+            geo_seqs = dl.get("geo_seqs", None) if isinstance(dl, dict) else None
+            if geo_seqs is not None:
+                for p in geo_seqs:
+                    # 关键：把字典里的每个 Tensor 移到 device
+                    geo_seqs[p] = geo_seqs[p].to(device=self.device, dtype=torch.long)
+
             outputs = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
                             geo_graph, geo_seqs=geo_seqs)
             if isinstance(outputs, tuple):
