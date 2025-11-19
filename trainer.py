@@ -42,26 +42,87 @@ class Trainer:
             self.model_dir.mkdir()
 
     def train(self, model, dataloader):
-        # prepare optimizer and criterion
-        optimizer = torch.optim.Adam(model.parameters(), lr=self.config.learning_rate)
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-        criterion = nn.CrossEntropyLoss(ignore_index=0)
-
-        # prepare dataloader
+        assert 5 in self.config.geohash_precisions
+        assert len(self.config.lambda_regions) == len(self.config.geohash_precisions)
         train_dl = dataloader.train_dataloader()
         val_dl = dataloader.val_dataloader()
-        # prepare model
         model = model.to(self.device)
+
+        with torch.no_grad():
+            try:
+                dl = next(iter(train_dl))
+                if isinstance(dl, dict):
+                    user = dl["user"].to(self.device)
+                    traj = dl["traj"].to(self.device)
+                    geo = dl["geo"].to(self.device)
+                    center_traj = dl["center_traj"].to(self.device)
+                    long_traj = dl["long_traj"].to(self.device)
+                    dt = dl["dt"].to(self.device)
+                    traj_graph = dl["traj_graph"].to(self.device)
+                    geo_graph = dl["geo_graph"].to(self.device)
+                else:
+                    user, traj, geo, center_traj, long_traj, dt, label_traj, \
+                        label_geo, negihbors_mask, traj_graph, geo_graph = dl
+                    user = user.to(self.device)
+                    traj = traj.to(self.device)
+                    geo = geo.to(self.device)
+                    center_traj = center_traj.to(self.device)
+                    long_traj = long_traj.to(self.device)
+                    dt = dt.to(self.device)
+                    traj_graph = traj_graph.to(self.device)
+                    geo_graph = geo_graph.to(self.device)
+                _ = model(user, traj, geo, center_traj, long_traj, dt, traj_graph, geo_graph)
+            except Exception:
+                pass
+
+        base_lr = float(self.config.learning_rate)
+        fusion_params = []
+        lcl = getattr(model, 'LocalCenterEncoder', None)
+        ste = getattr(model, 'ShortTermEncoder', None)
+        if lcl is not None:
+            lf = getattr(lcl, 'lite_fusion_long', None)
+            if lf is not None:
+                fusion_params += list(lf.parameters())
+        if ste is not None:
+            lf = getattr(ste, 'lite_fusion_short', None)
+            if lf is not None:
+                fusion_params += list(lf.parameters())
+        fusion_ids = {id(p) for p in fusion_params}
+        backbone_params = [p for p in model.parameters() if id(p) not in fusion_ids]
+        if len(fusion_params) == 0:
+            optimizer = torch.optim.Adam(model.parameters(), lr=base_lr)
+            self._fusion_group_index = None
+        else:
+            optimizer = torch.optim.Adam([
+                {'params': backbone_params, 'lr': base_lr},
+                {'params': fusion_params, 'lr': base_lr}
+            ])
+            self._fusion_group_index = 1
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+        criterion = nn.CrossEntropyLoss(ignore_index=0)
+        self._warmup_log_start = False
+        self._warmup_log_end = False
 
         self.logger.info('start training...')
         for epoch in range(self.config.epochs):
-            # train loop
-            self._train_epoch(epoch, model, train_dl, optimizer, scheduler, criterion)
+            cond = (epoch < int(self.config.warmup_epochs)) and \
+                   (int(getattr(self.config, 'use_fusion_long', 0)) == 1 or int(getattr(self.config, 'use_fusion_short', 0)) == 1)
+            if self._fusion_group_index is not None:
+                if cond:
+                    new_lr = base_lr * float(getattr(self.config, 'fusion_lr_scale', 0.3))
+                    optimizer.param_groups[self._fusion_group_index]['lr'] = new_lr
+                    if not self._warmup_log_start:
+                        self.logger.info('[fusion-warmup] lr <- base_lr * fusion_lr_scale')
+                        self._warmup_log_start = True
+                else:
+                    optimizer.param_groups[self._fusion_group_index]['lr'] = base_lr
+                    if self._warmup_log_start and not self._warmup_log_end:
+                        self.logger.info('[fusion-warmup] lr restored to base_lr')
+                        self._warmup_log_end = True
 
-            # valid loop
+            self._train_epoch(epoch, model, train_dl, optimizer, scheduler, criterion)
             if (epoch + 1) % 1 == 0:
                 self._val_epoch(model, val_dl, criterion)
-
             model_path = self.model_dir / f"model_{epoch+1}.pkl"
             torch.save(model.state_dict(), model_path)
         self.logger.info('training done!')
@@ -106,23 +167,14 @@ class Trainer:
             optimizer.zero_grad()
             outputs = model(user, traj, geo, center_traj, long_traj, dt, traj_graph,
                             geo_graph)
-            # 旧路径：二元组 (pred_traj, pred_geo_5)
             if isinstance(outputs, tuple):
                 pred_traj = outputs[0]
                 pred_geo_5 = outputs[1]
+                pred_regions = outputs[2] if len(outputs) >= 3 and isinstance(outputs[2], dict) else getattr(model, "pred_regions", None)
             else:
                 pred_traj = outputs
                 pred_geo_5 = None
-
-            # 兼容性读取 G4：优先从 outputs[2]（若为字典）读取，否则兜底 model.pred_regions
-            pred_geo_4 = None
-            if isinstance(outputs, tuple) and len(outputs) >= 3 and isinstance(outputs[2], dict):
-                pred_regions = outputs[2]
-                pred_geo_4 = pred_regions.get("G4", None)
-            else:
                 pred_regions = getattr(model, "pred_regions", None)
-                if isinstance(pred_regions, dict):
-                    pred_geo_4 = pred_regions.get("G4", None)
 
             if hasattr(self.config, 'mask') and self.config.mask:
                 negihbors_mask = negihbors_mask.unsqueeze(1).repeat(
@@ -131,35 +183,27 @@ class Trainer:
 
             # 计算损失（全局 softmax + CE），保持 ignore_index 与现有 criterion 一致
             loss_poi = criterion(pred_traj.permute(0, 2, 1), label_traj)
+            total_loss = loss_poi
             loss_geo_g5 = None
             loss_geo_g4 = None
-            if pred_geo_5 is not None:
-                loss_geo_g5 = criterion(pred_geo_5.permute(0, 2, 1), label_geo_5)
-            if hasattr(self.config, 'geohash_precisions') and (4 in self.config.geohash_precisions):
-                # fail-fast：启用 G4 必须有 label 与 pred
-                if label_geo_4 is None:
-                    self.logger.error('[ERROR] 缺少 label_geo_4。请检查数据缓存是否包含 geohash_id_4。')
-                    raise SystemExit(1)
-                if pred_geo_4 is None:
-                    self.logger.error('[ERROR] 缺少 pred_geo_4。请检查模型是否正确提供 G4 区域头。')
-                    raise SystemExit(1)
-                # 词表尺寸确认：pred 与头的 out_features 一致
-                vg4_out = getattr(getattr(model, 'fc_geo_4', None), 'out_features', None)
-                if vg4_out is None or vg4_out != pred_geo_4.shape[-1]:
-                    self.logger.error('[ERROR] G4 词表尺寸异常：fc_geo_4.out_features=%s, pred_geo_4.shape[-1]=%s',
-                                      str(vg4_out), str(pred_geo_4.shape[-1]))
-                    raise SystemExit(1)
-                loss_geo_g4 = criterion(pred_geo_4.permute(0, 2, 1), label_geo_4)
-
-            # 组合损失：动态权重按 geohash_precisions 与 lambda_regions
-            total_loss = loss_poi
-            for p, lam in zip(self.config.geohash_precisions, self.config.lambda_regions):
-                if lam <= 0:
-                    continue
-                if p == 5 and loss_geo_g5 is not None:
-                    total_loss = total_loss + lam * loss_geo_g5
-                elif p == 4 and loss_geo_g4 is not None:
-                    total_loss = total_loss + lam * loss_geo_g4
+            if isinstance(pred_regions, dict):
+                labels_map = {5: label_geo_5}
+                if label_geo_4 is not None:
+                    labels_map[4] = label_geo_4
+                for i, p in enumerate(self.config.geohash_precisions):
+                    lam = float(self.config.lambda_regions[i])
+                    if lam <= 0:
+                        continue
+                    logits_p = pred_regions.get(f"G{int(p)}", None)
+                    label_p = labels_map.get(int(p), None)
+                    if logits_p is None or label_p is None:
+                        continue
+                    lp = criterion(logits_p.permute(0, 2, 1), label_p)
+                    if int(p) == 5:
+                        loss_geo_g5 = lp
+                    if int(p) == 4:
+                        loss_geo_g4 = lp
+                    total_loss = total_loss + lam * lp
 
             total_loss.backward()
             optimizer.step()
@@ -221,18 +265,11 @@ class Trainer:
             if isinstance(outputs, tuple):
                 pred_traj = outputs[0]
                 pred_geo_5 = outputs[1]
+                pred_regions = outputs[2] if len(outputs) >= 3 and isinstance(outputs[2], dict) else getattr(model, "pred_regions", None)
             else:
                 pred_traj = outputs
                 pred_geo_5 = None
-
-            pred_geo_4 = None
-            if isinstance(outputs, tuple) and len(outputs) >= 3 and isinstance(outputs[2], dict):
-                pred_regions = outputs[2]
-                pred_geo_4 = pred_regions.get("G4", None)
-            else:
                 pred_regions = getattr(model, "pred_regions", None)
-                if isinstance(pred_regions, dict):
-                    pred_geo_4 = pred_regions.get("G4", None)
 
             if hasattr(self.config, 'mask') and self.config.mask:
                 negihbors_mask = negihbors_mask.unsqueeze(1).repeat(
@@ -240,32 +277,27 @@ class Trainer:
                 pred_traj.masked_fill_(negihbors_mask, -1000)
 
             loss_poi = criterion(pred_traj.permute(0, 2, 1), label_traj)
+            total_loss = loss_poi
             loss_geo_g5 = None
             loss_geo_g4 = None
-            if pred_geo_5 is not None:
-                loss_geo_g5 = criterion(pred_geo_5.permute(0, 2, 1), label_geo_5)
-            if hasattr(self.config, 'geohash_precisions') and (4 in self.config.geohash_precisions):
-                if label_geo_4 is None:
-                    self.logger.error('[ERROR] 缺少 label_geo_4。请检查数据缓存是否包含 geohash_id_4。')
-                    raise SystemExit(1)
-                if pred_geo_4 is None:
-                    self.logger.error('[ERROR] 缺少 pred_geo_4。请检查模型是否正确提供 G4 区域头。')
-                    raise SystemExit(1)
-                vg4_out = getattr(getattr(model, 'fc_geo_4', None), 'out_features', None)
-                if vg4_out is None or vg4_out != pred_geo_4.shape[-1]:
-                    self.logger.error('[ERROR] G4 词表尺寸异常：fc_geo_4.out_features=%s, pred_geo_4.shape[-1]=%s',
-                                      str(vg4_out), str(pred_geo_4.shape[-1]))
-                    raise SystemExit(1)
-                loss_geo_g4 = criterion(pred_geo_4.permute(0, 2, 1), label_geo_4)
-
-            total_loss = loss_poi
-            for p, lam in zip(self.config.geohash_precisions, self.config.lambda_regions):
-                if lam <= 0:
-                    continue
-                if p == 5 and loss_geo_g5 is not None:
-                    total_loss = total_loss + lam * loss_geo_g5
-                elif p == 4 and loss_geo_g4 is not None:
-                    total_loss = total_loss + lam * loss_geo_g4
+            if isinstance(pred_regions, dict):
+                labels_map = {5: label_geo_5}
+                if label_geo_4 is not None:
+                    labels_map[4] = label_geo_4
+                for i, p in enumerate(self.config.geohash_precisions):
+                    lam = float(self.config.lambda_regions[i])
+                    if lam <= 0:
+                        continue
+                    logits_p = pred_regions.get(f"G{int(p)}", None)
+                    label_p = labels_map.get(int(p), None)
+                    if logits_p is None or label_p is None:
+                        continue
+                    lp = criterion(logits_p.permute(0, 2, 1), label_p)
+                    if int(p) == 5:
+                        loss_geo_g5 = lp
+                    if int(p) == 4:
+                        loss_geo_g4 = lp
+                    total_loss = total_loss + lam * lp
 
             val_acc.append(calculate_acc(pred_traj, label_traj))
             val_loss.append(total_loss.item())
